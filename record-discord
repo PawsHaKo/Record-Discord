@@ -1,0 +1,533 @@
+#!/bin/bash
+# record-discord — 自動錄 Discord 直播（Chrome 網頁版）
+#
+# 用法:
+#   record-discord <網址>     開始：切音訊輸出 → 開直播頁 → 偵測到分享畫面後自動錄影
+#                             （常錄同一頻道可把網址存進 ~/.config/record-discord/url，
+#                               之後直接跑 record-discord 就好）
+#   record-discord --chat     同上，但會幫你點開聊天室，錄影範圍含聊天室
+#   record-discord stop       停止錄影並還原音訊輸出
+#   record-discord status     查看目前錄影狀態
+#
+# 停止錄影的方式:
+#   1. 點螢幕上的懸浮「⏹ 停止錄影」按鈕（放在錄影範圍外，不會被錄到）
+#   2. 終端機跑 record-discord stop
+#   3. 加 --auto-stop 的話，直播 video 消失約 2 分鐘後自動停止。
+#      預設關閉：主持人可能只是暫停分享畫面但繼續講話。
+#
+# 需求: SwitchAudioSource (brew install switchaudio-osx)、BlackHole 2ch、
+#       Chrome 開啟「檢視 > 開發人員 > 允許 Apple 事件中的 JavaScript」
+set -u
+
+DEFAULT_URL_FILE="$HOME/.config/record-discord/url" # 預設直播頁網址（一行）
+DISCORD_URL="${RD_URL:-}"                           # 可被命令列的網址參數覆蓋
+URL_MATCH="${RD_URL_MATCH:-}"                       # 留空＝從網址自動推導
+MIN_RATIO="${RD_MIN_RATIO:-0.5}"                    # video 需佔視窗寬度比例才視為「分享畫面」
+OUTPUT_DEVICE="${RD_OUTPUT_DEVICE:-Record w Sound}" # 錄影期間的聲音輸出裝置（多重輸出）
+AUDIO_UID="${RD_AUDIO_UID:-BlackHole2ch_UID}"       # screencapture 收音來源（系統聲音）
+OUT_DIR="$HOME/Movies"
+POLL_INTERVAL=2
+POLL_TIMEOUT=1800                                   # 最多等 30 分鐘偵測分享畫面
+
+STATE_DIR="$HOME/.local/state/record-discord"
+PID_FILE="$STATE_DIR/pid"
+DEV_FILE="$STATE_DIR/prev-output-device"
+OUT_FILE="$STATE_DIR/current-file"
+BTN_PID_FILE="$STATE_DIR/button-pid"
+WATCH_PID_FILE="$STATE_DIR/watcher-pid"
+
+# 解析真實路徑（可能是透過 /opt/homebrew/bin 的 symlink 執行）
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+FLOAT_JS="$(dirname "$SELF")/float-stop.js"
+
+notify() {
+  osascript -e "display notification \"$1\" with title \"record-discord\"" >/dev/null 2>&1
+}
+
+is_recording() {
+  [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+# 在 Chrome 所有視窗中找 Discord 分頁；有就切到最前面，沒有就開新分頁
+focus_or_open_tab() {
+  osascript - "$URL_MATCH" "$DISCORD_URL" <<'EOF'
+on run argv
+  set urlMatch to item 1 of argv
+  set targetURL to item 2 of argv
+  tell application "Google Chrome"
+    activate
+    set found to false
+    repeat with w in windows
+      if mode of w is not "incognito" then
+        set ti to 1
+        repeat with t in tabs of w
+          if URL of t contains urlMatch then
+            set active tab index of w to ti
+            if minimized of w then set minimized of w to false
+            set index of w to 1
+            set found to true
+            exit repeat
+          end if
+          set ti to ti + 1
+        end repeat
+      end if
+      if found then exit repeat
+    end repeat
+    if not found then
+      -- 開在第一個非無痕、非縮小的視窗；都沒有就開新視窗
+      set target to missing value
+      repeat with w in windows
+        if mode of w is not "incognito" and not (minimized of w) then
+          set target to w
+          exit repeat
+        end if
+      end repeat
+      if target is missing value then set target to make new window
+      tell target to make new tab with properties {URL:targetURL}
+      set index of target to 1
+    end if
+  end tell
+end run
+EOF
+}
+
+# 在最前面的 Discord 分頁裡執行 JavaScript（只認非縮小視窗中、目前顯示
+# 在最前面的分頁）。回傳 JS 結果，或 NOTAB / NOTACTIVE。
+run_js_in_tab() {
+  osascript - "$URL_MATCH" "$1" <<'EOF'
+on run argv
+  set urlMatch to item 1 of argv
+  set js to item 2 of argv
+  tell application "Google Chrome"
+    set foundTab to false
+    repeat with w in windows
+      if mode of w is not "incognito" then
+        if not (minimized of w) then
+          if (URL of active tab of w) contains urlMatch then
+            return execute (active tab of w) javascript js
+          end if
+        end if
+        repeat with t in tabs of w
+          if URL of t contains urlMatch then set foundTab to true
+        end repeat
+      end if
+    end repeat
+    if foundTab then return "NOTACTIVE"
+  end tell
+  return "NOTAB"
+end run
+EOF
+}
+
+# 找最大的可見 <video>，回傳螢幕座標 "x,y,w,h"。
+# $1=with_chat: 1 的話把聊天室（訊息列表＋輸入框）一併算進範圍。
+# video 範圍會先跟視窗可視區域取交集（背景分頁或捲出畫面的 video
+# 會回報螢幕外座標）。
+# 其他回傳值: NOTAB / NOTACTIVE / NOVIDEO / TOOSMALL / NOCHAT
+get_video_rect() {
+  local with_chat="${1:-0}"
+  run_js_in_tab "(function(){var w=window;var clamp=function(r){var x1=Math.max(r.left,0),y1=Math.max(r.top,0),x2=Math.min(r.right,w.innerWidth),y2=Math.min(r.bottom,w.innerHeight);return (x2>x1&&y2>y1)?{x1:x1,y1:y1,x2:x2,y2:y2}:null;};var vs=[].slice.call(document.querySelectorAll('video'));if(!vs.length)return 'NOVIDEO';var best=null,ba=0;for(var i=0;i<vs.length;i++){var c=clamp(vs[i].getBoundingClientRect());if(c){var a=(c.x2-c.x1)*(c.y2-c.y1);if(a>ba){ba=a;best=c;}}}if(!best||(best.x2-best.x1)<w.innerWidth*${MIN_RATIO}||(best.y2-best.y1)<200)return 'TOOSMALL';var u=best;if(${with_chat}){var chat=document.querySelector('[data-list-id=\"chat-messages\"]');var cc=chat?clamp(chat.getBoundingClientRect()):null;if(!cc)return 'NOCHAT';u={x1:Math.min(u.x1,cc.x1),y1:Math.min(u.y1,cc.y1),x2:Math.max(u.x2,cc.x2),y2:Math.max(u.y2,cc.y2)};var tb=document.querySelector('form [role=\"textbox\"]');var f=tb?tb.closest('form'):null;var fc=f?clamp(f.getBoundingClientRect()):null;if(fc){u.x2=Math.max(u.x2,fc.x2);u.y2=Math.max(u.y2,fc.y2);}}var chromeH=w.outerHeight-w.innerHeight;var chromeX=(w.outerWidth-w.innerWidth)/2;return Math.round(w.screenX+chromeX+u.x1)+','+Math.round(w.screenY+chromeH+u.y1)+','+Math.round(u.x2-u.x1)+','+Math.round(u.y2-u.y1);})()"
+}
+
+# 直播預覽磚要點一下才會放大成焦點畫面。優先點外層帶「直播/LIVE」
+# 標記的磚（避免點到成員的鏡頭），沒有就點最大的 video。
+# 回傳: CLICKED / NOVIDEO / NOTAB / NOTACTIVE
+try_focus_stream() {
+  run_js_in_tab "(function(){var vs=[].slice.call(document.querySelectorAll('video'));var pick=null,ba=0,live=null;for(var i=0;i<vs.length;i++){var r=vs[i].getBoundingClientRect();var a=r.width*r.height;if(a<=0)continue;if(a>ba){ba=a;pick=vs[i];}var p=vs[i],hops=0;while(p&&hops<6){p=p.parentElement;hops++;if(!p)break;var tx=p.textContent||'';if(tx.length<200&&/直播|LIVE/.test(tx)){live=vs[i];break;}}}var t=live||pick;if(!t)return 'NOVIDEO';['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(ty){var Ev=ty.indexOf('pointer')===0?PointerEvent:MouseEvent;t.dispatchEvent(new Ev(ty,{bubbles:true,cancelable:true,view:window}));});return 'CLICKED';})()"
+}
+
+# 舞台頻道要先加入才看得到直播；找「加入舞台」按鈕點下去（觀眾身分）。
+# 用整顆按鈕的文字精確比對，不會誤點旁邊的「邀請」。
+# 回傳: JOINED / NONE / NOTAB / NOTACTIVE
+try_join_stage() {
+  run_js_in_tab "(function(){var re=/^(加入舞[台臺]|join stage)\$/i;var bs=document.querySelectorAll('button');for(var i=0;i<bs.length;i++){var t=(bs[i].textContent||'').trim();if(re.test(t)){bs[i].click();return 'JOINED';}}return 'NONE';})()"
+}
+
+# 確保聊天室面板是開的（點右上角的聊天圖示）。
+# 回傳: ALREADY / OPENED / NOBUTTON / NOTAB / NOTACTIVE
+ensure_chat_open() {
+  run_js_in_tab "(function(){if(document.querySelector('[data-list-id=\"chat-messages\"]'))return 'ALREADY';var re=/^((open|show) chat|(開啟|顯示)聊天室?)\$/i;var els=document.querySelectorAll('button[aria-label],[role=\"button\"][aria-label]');for(var i=0;i<els.length;i++){var l=(els[i].getAttribute('aria-label')||'').trim();if(re.test(l)){els[i].click();return 'OPENED:'+l;}}return 'NOBUTTON';})()"
+}
+
+restore_audio() {
+  if [[ -f "$DEV_FILE" ]]; then
+    SwitchAudioSource -s "$(cat "$DEV_FILE")" -t output >/dev/null && rm -f "$DEV_FILE"
+  fi
+}
+
+# 收掉懸浮按鈕和自動偵測 watcher
+kill_helpers() {
+  local f pid
+  for f in "$BTN_PID_FILE" "$WATCH_PID_FILE"; do
+    if [[ -f "$f" ]]; then
+      pid="$(cat "$f")"
+      kill "$pid" 2>/dev/null
+      rm -f "$f"
+    fi
+  done
+}
+
+# 檢查直播是否還活著（$1=分頁比對字串，含背景分頁；
+# 用 videoWidth 判斷，不用座標——背景分頁的座標不可靠）
+# 回傳: ALIVE / DEAD / NOTAB
+check_stream_alive() {
+  osascript - "${1:-$URL_MATCH}" <<'EOF'
+on run argv
+  set urlMatch to item 1 of argv
+  tell application "Google Chrome"
+    repeat with w in windows
+      if mode of w is not "incognito" then
+        repeat with t in tabs of w
+          if URL of t contains urlMatch then
+            return execute t javascript "(function(){var vs=document.querySelectorAll('video');for(var i=0;i<vs.length;i++){if(vs[i].videoWidth>0&&!vs[i].ended)return 'ALIVE';}return 'DEAD';})()"
+          end if
+        end repeat
+      end if
+    end repeat
+  end tell
+  return "NOTAB"
+end run
+EOF
+}
+
+# 背景 watcher：直播 video 連續消失一段時間就自動停止錄影
+cmd_watch() {
+  local interval="${RD_WATCH_INTERVAL:-20}" max_miss="${RD_WATCH_MISSES:-6}"
+  local misses=0 st
+  while true; do
+    sleep "$interval"
+    is_recording || exit 0
+    st="$(check_stream_alive 2>/dev/null || true)"
+    # 使用者在 Discord 裡點到別的頁面會讓分頁網址變掉；找不到指定頻道
+    # 的分頁時，退回找任何 Discord 分頁，避免誤判成直播結束
+    if [[ "$st" == "NOTAB" && "$URL_MATCH" == discord.com/channels/* ]]; then
+      st="$(check_stream_alive "discord.com/channels" 2>/dev/null || true)"
+    fi
+    if [[ "$st" == "ALIVE" ]]; then
+      misses=0
+      continue
+    fi
+    misses=$((misses + 1))
+    if (( misses == 1 )); then
+      notify "直播畫面消失了，若一直沒回來將自動停止錄影"
+    fi
+    if (( misses >= max_miss )); then
+      notify "直播已結束，自動停止錄影"
+      "$SELF" stop
+      exit 0
+    fi
+  done
+}
+
+cmd_start() {
+  if is_recording; then
+    echo "已經在錄影中（pid $(cat "$PID_FILE")）。要停止請執行: record-discord stop" >&2
+    exit 1
+  fi
+  rm -f "$PID_FILE"
+  mkdir -p "$STATE_DIR" "$OUT_DIR"
+
+  # 1. 切換聲音輸出（先記住原本的裝置）
+  local prev_dev
+  prev_dev="$(SwitchAudioSource -c -t output)"
+  if [[ "$prev_dev" != "$OUTPUT_DEVICE" ]]; then
+    printf '%s' "$prev_dev" > "$DEV_FILE"
+  fi
+  SwitchAudioSource -s "$OUTPUT_DEVICE" -t output >/dev/null || {
+    echo "錯誤: 找不到輸出裝置「${OUTPUT_DEVICE}」" >&2; exit 1; }
+  echo "✓ 聲音輸出已切到「${OUTPUT_DEVICE}」（原本: ${prev_dev}）"
+
+  # 中途按 Ctrl-C 取消的話，把聲音輸出還原
+  trap 'echo; echo "已取消，還原聲音輸出。"; restore_audio; exit 130' INT TERM
+
+  # 2. 開啟（或切到）Discord 直播分頁
+  focus_or_open_tab
+  echo "✓ 直播頁已開啟: $DISCORD_URL"
+
+  # 3. 等你點進主持人的分享畫面，偵測到大的 video 就自動開錄
+  echo "… 等待偵測分享畫面（請在 Chrome 點進主持人的直播畫面）"
+  local rect="" state="" last_state="" deadline=$((SECONDS + POLL_TIMEOUT))
+  while (( SECONDS < deadline )); do
+    rect="$(get_video_rect 2>/dev/null || true)"
+    case "$rect" in
+      *,*,*,*) break ;;
+      NOTAB)     state="  （找不到 Discord 分頁，等待中…）" ;;
+      NOTACTIVE) state="  （Discord 分頁不在最前面，請切回該分頁…）" ;;
+      NOVIDEO)   state="  （還沒看到直播畫面，請點進主持人的分享畫面…）" ;;
+      TOOSMALL)  state="  （偵測到的畫面太小，請點進分享畫面放大…）" ;;
+    esac
+    [[ "$state" != "$last_state" ]] && echo "$state" && last_state="$state"
+    # 舞台頻道：看到「加入舞台」按鈕就自動加入（觀眾身分）
+    if [[ "$(try_join_stage 2>/dev/null || true)" == "JOINED" ]]; then
+      echo "  ✓ 已自動點「加入舞台」"
+    fi
+    # 直播還是小小的預覽磚 → 自動點它放大
+    if [[ "$rect" == "TOOSMALL" ]]; then
+      if [[ "$(try_focus_stream 2>/dev/null || true)" == "CLICKED" ]]; then
+        echo "  ✓ 已自動點擊直播畫面放大"
+      fi
+    fi
+    rect=""
+    sleep "$POLL_INTERVAL"
+  done
+  if [[ -z "$rect" ]]; then
+    echo "錯誤: 等了 $((POLL_TIMEOUT/60)) 分鐘都沒偵測到分享畫面，取消。" >&2
+    restore_audio
+    exit 1
+  fi
+
+  # 3b. 聊天室模式：點開聊天室，等版面重排後改抓「直播畫面＋聊天室」的範圍
+  if (( WITH_CHAT )); then
+    local chat_state chat_ok=1
+    chat_state="$(ensure_chat_open 2>/dev/null || true)"
+    case "$chat_state" in
+      OPENED:*) echo "✓ 已點開聊天室（${chat_state#OPENED:}）" ; sleep 2 ;;
+      ALREADY)  echo "✓ 聊天室已經是開的" ;;
+      *) echo "警告: 找不到聊天室按鈕（${chat_state}），改錄純直播畫面" >&2 ; chat_ok=0 ;;
+    esac
+    if (( chat_ok )); then
+      local i chat_rect=""
+      for i in 1 2 3 4 5; do
+        chat_rect="$(get_video_rect 1 2>/dev/null || true)"
+        case "$chat_rect" in *,*,*,*) break ;; esac
+        chat_rect=""
+        sleep 1
+      done
+      if [[ -n "$chat_rect" ]]; then
+        rect="$chat_rect"
+        echo "✓ 錄影範圍含聊天室"
+      else
+        # 聊天室量不到就退回純直播畫面（版面已變，重量一次）
+        echo "警告: 量不到聊天室範圍，改錄純直播畫面" >&2
+        for i in 1 2 3; do
+          chat_rect="$(get_video_rect 0 2>/dev/null || true)"
+          case "$chat_rect" in *,*,*,*) rect="$chat_rect"; break ;; esac
+          sleep 1
+        done
+      fi
+    fi
+  fi
+
+  # 4. 開始錄影（區域＝分享畫面，聲音＝BlackHole 系統音）
+  local outfile="$OUT_DIR/discord-live-$(date +%Y%m%d-%H%M%S).mov"
+  nohup screencapture -v -x -G "$AUDIO_UID" -R "$rect" "$outfile" >/dev/null 2>&1 &
+  local pid=$!
+  sleep 1
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "錯誤: screencapture 啟動失敗（檢查「螢幕錄製」權限）" >&2
+    restore_audio
+    exit 1
+  fi
+  echo "$pid" > "$PID_FILE"
+  printf '%s' "$outfile" > "$OUT_FILE"
+  trap - INT TERM
+
+  # 5. 懸浮停止按鈕（擺在錄影範圍外，不會被錄進去）
+  if [[ "${RD_NO_BUTTON:-0}" != 1 ]]; then
+    local rx ry rw rh bx by overlap=0
+    IFS=, read -r rx ry rw rh <<< "$rect"
+    if (( rx >= 175 )); then           # 錄影範圍左邊有空間（Discord 側欄）
+      bx=$((rx - 165)); by=$((ry + rh / 2 - 40))
+    elif (( ry >= 140 )); then         # 不然放上面
+      bx=$rx; by=$((ry - 130))
+    else                               # 都沒空間，只好疊在畫面裡（會被錄到）
+      bx=$((rx + 10)); by=$((ry + 10)); overlap=1
+    fi
+    (( bx < 5 )) && bx=5
+    (( by < 40 )) && by=40
+    nohup osascript "$FLOAT_JS" "$bx" "$by" "\"$SELF\" stop" >/dev/null 2>&1 &
+    echo $! > "$BTN_PID_FILE"
+    if (( overlap )); then
+      echo "  （注意: 錄影範圍太大，懸浮按鈕只能放在畫面內，會被錄到）"
+    fi
+  fi
+
+  # 6. 背景偵測直播結束，自動停止（預設關閉——主持人可能停止分享
+  #    畫面但繼續講話，要錄到完整聲音就不能自動停）
+  if (( AUTO_STOP )); then
+    RD_URL="$DISCORD_URL" RD_URL_MATCH="$URL_MATCH" nohup "$SELF" _watch >/dev/null 2>&1 &
+    echo $! > "$WATCH_PID_FILE"
+  fi
+
+  echo "● 錄影中  區域: $rect"
+  echo "  檔案: $outfile"
+  if (( AUTO_STOP )); then
+    echo "  停止: 點懸浮的「⏹ 停止錄影」按鈕（直播結束也會自動停止）"
+  else
+    echo "  停止: 點懸浮的「⏹ 停止錄影」按鈕"
+  fi
+  notify "已開始錄影 (${rect##*,}p)"
+}
+
+cmd_stop() {
+  if ! is_recording; then
+    echo "目前沒有在錄影。" >&2
+    kill_helpers
+    restore_audio
+    rm -f "$PID_FILE" "$OUT_FILE"
+    exit 1
+  fi
+  local pid outfile
+  pid="$(cat "$PID_FILE")"
+  outfile="$(cat "$OUT_FILE" 2>/dev/null || echo "?")"
+
+  kill_helpers
+  kill -INT "$pid"
+  echo "… 停止錄影，等待檔案寫入完成"
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null && (( waited < 60 )); do
+    sleep 1; ((waited++))
+  done
+  rm -f "$PID_FILE" "$OUT_FILE"
+
+  restore_audio
+  echo "✓ 聲音輸出已還原"
+
+  if [[ -f "$outfile" ]]; then
+    local size dur=""
+    size="$(du -h "$outfile" | cut -f1 | tr -d ' ')"
+    if command -v ffprobe >/dev/null; then
+      dur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$outfile" 2>/dev/null | cut -d. -f1)"
+      [[ -n "$dur" ]] && dur="，長度 $((dur/60)) 分 $((dur%60)) 秒"
+    fi
+    echo "✓ 錄影完成: ${outfile}（${size}${dur}）"
+    notify "錄影完成（${size}${dur}）"
+    open -R "$outfile"
+  else
+    echo "警告: 找不到錄影檔 $outfile" >&2
+  fi
+}
+
+cmd_status() {
+  if is_recording; then
+    local outfile pid
+    pid="$(cat "$PID_FILE")"
+    outfile="$(cat "$OUT_FILE" 2>/dev/null || echo "?")"
+    echo "● 錄影中 (pid $pid)"
+    echo "  檔案: $outfile"
+    [[ -f "$BTN_PID_FILE" ]] && kill -0 "$(cat "$BTN_PID_FILE")" 2>/dev/null \
+      && echo "  懸浮按鈕: 顯示中" || echo "  懸浮按鈕: 無"
+    [[ -f "$WATCH_PID_FILE" ]] && kill -0 "$(cat "$WATCH_PID_FILE")" 2>/dev/null \
+      && echo "  自動偵測直播結束: 執行中" || echo "  自動偵測直播結束: 無"
+  else
+    echo "沒有在錄影。"
+  fi
+  echo "  目前聲音輸出: $(SwitchAudioSource -c -t output)"
+}
+
+WITH_CHAT="${RD_CHAT:-0}"
+AUTO_STOP="${RD_AUTOSTOP:-0}"
+CMD="start"
+for arg in "$@"; do
+  case "$arg" in
+    start|stop|status|doctor|_watch) CMD="$arg" ;;
+    --chat) WITH_CHAT=1 ;;
+    --auto-stop) AUTO_STOP=1 ;;
+    http://*|https://*) DISCORD_URL="$arg" ;;
+    *) echo "用法: record-discord [start|stop|status|doctor] [--chat] [--auto-stop] [直播頁網址]" >&2; exit 1 ;;
+  esac
+done
+
+# 網址來源優先序：命令列參數 > RD_URL > 設定檔
+if [[ -z "$DISCORD_URL" && -f "$DEFAULT_URL_FILE" ]]; then
+  DISCORD_URL="$(head -1 "$DEFAULT_URL_FILE")"
+fi
+if [[ -z "$DISCORD_URL" && "$CMD" == "start" ]]; then
+  echo "錯誤: 請提供直播頁網址，例如:" >&2
+  echo "  record-discord https://discord.com/channels/<伺服器ID>/<頻道ID>" >&2
+  echo "或把常用網址存成預設值（一行網址）:" >&2
+  echo "  mkdir -p ~/.config/record-discord && echo '網址' > ~/.config/record-discord/url" >&2
+  exit 1
+fi
+
+# 沒指定 RD_URL_MATCH 就從網址推導分頁比對字串：
+# Discord 網址取「discord.com/channels/伺服器ID/頻道ID」精確鎖定頻道，
+# 其他網站取去掉 http(s):// 的部分。
+if [[ -z "$URL_MATCH" && -n "$DISCORD_URL" ]]; then
+  URL_MATCH="$(printf '%s' "$DISCORD_URL" | grep -oE 'discord\.com/channels/[0-9]+/[0-9]+' | head -1)"
+  [[ -z "$URL_MATCH" ]] && URL_MATCH="${DISCORD_URL#*://}"
+fi
+
+# 環境自我檢查（給新使用者的前置作業驗證）
+cmd_doctor() {
+  local pass=0 fail=0
+  ok()   { echo "  ✅ $1"; pass=$((pass+1)); }
+  bad()  { echo "  ❌ $1"; fail=$((fail+1)); }
+
+  echo "record-discord 環境檢查"
+  echo "── 必要工具 ──"
+  if command -v SwitchAudioSource >/dev/null; then
+    ok "SwitchAudioSource 已安裝"
+  else
+    bad "SwitchAudioSource 未安裝 → brew install switchaudio-osx"
+  fi
+
+  echo "── 音訊裝置 ──"
+  local outs=""
+  command -v SwitchAudioSource >/dev/null && outs="$(SwitchAudioSource -a -t output)"
+  if printf '%s' "$outs" | grep -q "BlackHole 2ch"; then
+    ok "BlackHole 2ch 已安裝"
+  else
+    bad "BlackHole 2ch 未安裝 → brew install blackhole-2ch（裝完要重開機或重啟 coreaudiod）"
+  fi
+  if printf '%s' "$outs" | grep -qF "$OUTPUT_DEVICE"; then
+    ok "多重輸出裝置「${OUTPUT_DEVICE}」存在"
+  else
+    bad "找不到輸出裝置「${OUTPUT_DEVICE}」→ 用「音訊 MIDI 設定」建立多重輸出裝置（見 README），或用 RD_OUTPUT_DEVICE 指定你取的名字"
+  fi
+
+  echo "── Chrome ──"
+  if open -Ra "Google Chrome" 2>/dev/null; then
+    ok "Google Chrome 已安裝"
+    local js_test
+    js_test="$(osascript -e 'tell application "Google Chrome" to if (count of windows) > 0 then execute front window'\''s active tab javascript "1+1"' 2>&1)"
+    if [[ "$js_test" == "2" ]]; then
+      ok "Chrome 允許 Apple 事件執行 JavaScript"
+    elif [[ "$js_test" == *"1084"* || "$js_test" == *avaScript* ]]; then
+      bad "Chrome 未開啟「檢視 > 開發人員 > 允許 Apple 事件中的 JavaScript」"
+    else
+      bad "無法測試 Chrome JavaScript（Chrome 沒開視窗，或「自動化」權限未授權）: $js_test"
+    fi
+  else
+    bad "Google Chrome 未安裝"
+  fi
+
+  echo "── macOS 權限 ──"
+  local probe="/tmp/rd-doctor-probe.png"
+  rm -f "$probe"
+  screencapture -x -R 0,0,20,20 "$probe" 2>/dev/null
+  if [[ -s "$probe" ]]; then
+    ok "螢幕錄製權限正常"
+    rm -f "$probe"
+  else
+    bad "螢幕錄製權限未授權 → 系統設定 > 隱私權與安全性 > 螢幕錄製，把你的終端機 App 打勾"
+  fi
+
+  echo "── 其他 ──"
+  if [[ -f "$FLOAT_JS" ]]; then
+    ok "懸浮按鈕腳本存在（float-stop.js）"
+  else
+    bad "找不到 ${FLOAT_JS}（要跟 record-discord 放同一個資料夾）"
+  fi
+  if command -v ffprobe >/dev/null; then
+    ok "ffprobe 已安裝（選用，顯示錄影長度）"
+  else
+    echo "  ⚠️  ffprobe 未安裝（選用）→ brew install ffmpeg"
+  fi
+
+  echo
+  if (( fail == 0 )); then
+    echo "全部通過（${pass} 項）！可以開始使用。"
+  else
+    echo "還有 ${fail} 項要處理（通過 ${pass} 項）。"
+    exit 1
+  fi
+}
+
+case "$CMD" in
+  start)  cmd_start ;;
+  stop)   cmd_stop ;;
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  _watch) cmd_watch ;;
+esac
