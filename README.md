@@ -132,6 +132,7 @@ ln -s "$(pwd)/record-discord" /opt/homebrew/bin/record-discord
 | `RD_URL` | （參數或設定檔） | 要開啟的直播頁網址 |
 | `RD_URL_MATCH` | `discord.com/channels` | 用哪個字串找分頁 |
 | `RD_MIN_RATIO` | `0.5` | video 需佔視窗寬度的比例才開錄 |
+| `RD_POLL_TIMEOUT` | `1800` | 最多等幾秒偵測分享畫面（可提早掛機等開播） |
 | `RD_CHAT` | `0` | 設 1 等同 `--chat` |
 | `RD_AUTOSTOP` | `0` | 設 1 等同 `--auto-stop` |
 | `RD_NO_BUTTON` | `0` | 設 1 不顯示懸浮停止按鈕 |
