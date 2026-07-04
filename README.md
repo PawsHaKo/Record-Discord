@@ -10,7 +10,7 @@ with system audio, and restores your audio setup when done.
 ## 用法
 
 ```sh
-record-discord <直播頁網址>   # 開始：切音訊 → 開直播頁 → 偵測到分享畫面後自動開錄
+record-discord <直播頁網址>   # 開始錄影（全自動，見下方流程）
 record-discord --chat        # 加上這個會自動點開聊天室，錄影範圍含聊天室訊息
 record-discord --auto-stop   # 直播 video 消失約 2 分鐘後自動停止錄影
 record-discord stop          # 手動停止：停止錄影、還原聲音輸出、打開檔案位置
@@ -25,6 +25,24 @@ mkdir -p ~/.config/record-discord
 echo 'https://discord.com/channels/<伺服器ID>/<頻道ID>' > ~/.config/record-discord/url
 ```
 
+## 開錄流程（全自動）
+
+跑指令之後基本上什麼都不用做，腳本每 2 秒偵測一次、看到什麼做什麼：
+
+1. 聲音輸出切到多重輸出裝置（你照常聽得到聲音）
+2. 開啟（或切到）直播頁分頁
+3. 舞台頻道自動點「加入舞台 / Join Stage」（觀眾身分）
+4. 直播還是小預覽磚時，自動點擊放大成焦點畫面
+   （優先點帶「直播/LIVE」標記的磚，不會誤點成員鏡頭）
+5. 直播畫面夠大（video 佔視窗寬度 50% 以上）→ 自動開始錄影＋系統通知
+
+錄影檔存在 `~/Movies/discord-live-日期時間.mov`。
+
+**可以提早掛機等開播**：直播還沒開始也能先跑指令，舞台一開放就自動加入、
+主持人一分享就自動開錄。預設最多等 30 分鐘，要等更久用
+`RD_POLL_TIMEOUT=7200 record-discord`。等待期間讓 Discord 分頁留在
+最前面（切走不會壞，但偵測會暫停到你切回來）。
+
 ## 停止錄影的方式
 
 1. **懸浮按鈕（主要方式）**：錄影開始後螢幕上會出現置頂的「⏹ 停止錄影」
@@ -35,17 +53,9 @@ echo 'https://discord.com/channels/<伺服器ID>/<頻道ID>' > ~/.config/record-
    預設關閉——主持人可能只是暫停分享畫面但繼續講話。
 3. **終端機**：`record-discord stop`（注意切到終端機的過程會被錄進去）。
 
-跑 `record-discord` 之後基本上什麼都不用做——以下都會自動處理：
-
-- 舞台頻道自動點「加入舞台 / Join Stage」（觀眾身分）
-- 直播還是小預覽磚時，自動點擊放大成焦點畫面
-  （優先點帶「直播/LIVE」標記的磚，不會誤點成員鏡頭）
-腳本每 2 秒偵測一次，看到夠大的直播畫面（video 佔視窗寬度 50% 以上）就
-自動開始錄影，並發系統通知。錄影檔存在 `~/Movies/discord-live-日期時間.mov`。
-
 ## 運作方式
 
-1. `SwitchAudioSource` 把聲音輸出切到 **Record w Sound**（先記住原本的裝置）
+1. `SwitchAudioSource` 把聲音輸出切到多重輸出裝置（先記住原本的裝置）
 2. 在 Chrome 找到（或開啟）Discord 直播分頁並帶到最前面
 3. 用 AppleScript 叫 Chrome 執行 JavaScript，抓到直播 `<video>` 元素
    在螢幕上的精確座標（會跟視窗可視範圍取交集，避免抓到螢幕外的假座標）
@@ -53,8 +63,8 @@ echo 'https://discord.com/channels/<伺服器ID>/<頻道ID>' > ~/.config/record-
      Show Chat / 開啟聊天 / 顯示聊天，精確比對，避免誤點名叫「聊天室」
      的頻道），等版面重排後，錄影範圍改為「video ∪ 聊天訊息列表 ∪
      輸入框」的聯集。找不到按鈕或量不到聊天室時自動退回純直播畫面。
-4. `screencapture -v -R <區域> -G BlackHole2ch_UID` 錄影：
-   區域＝分享畫面、聲音＝BlackHole 收系統音，**不會動到預設麥克風（Yeti）**
+4. `screencapture -v -R <區域> -G <BlackHole UID>` 錄影：
+   區域＝分享畫面、聲音＝BlackHole 收系統音，**不會動到你的麥克風設定**
 5. `stop` 時送 SIGINT 讓檔案完整收尾，再把聲音輸出還原
 
 ## 安裝與前置作業（第一次使用）
@@ -116,7 +126,6 @@ ln -s "$(pwd)/record-discord" /opt/homebrew/bin/record-discord
 
 ## 注意事項
 
-- 偵測時 Discord 分頁要顯示在最前面（腳本會自動幫你切過去）
 - Chrome 的頁面縮放請維持 100%，否則座標會偏
 - 錄影區域是固定座標：錄影中不要移動/縮放該 Chrome 視窗，
   也不要讓其他視窗蓋住直播畫面
@@ -130,13 +139,15 @@ ln -s "$(pwd)/record-discord" /opt/homebrew/bin/record-discord
 | `RD_OUTPUT_DEVICE` | `Record w Sound` | 錄影期間切換到的多重輸出裝置名稱 |
 | `RD_AUDIO_UID` | `BlackHole2ch_UID` | 錄影收音的裝置 UID |
 | `RD_URL` | （參數或設定檔） | 要開啟的直播頁網址 |
-| `RD_URL_MATCH` | `discord.com/channels` | 用哪個字串找分頁 |
+| `RD_URL_MATCH` | （從網址自動推導） | 用哪個字串找分頁 |
 | `RD_MIN_RATIO` | `0.5` | video 需佔視窗寬度的比例才開錄 |
 | `RD_POLL_TIMEOUT` | `1800` | 最多等幾秒偵測分享畫面（可提早掛機等開播） |
 | `RD_CHAT` | `0` | 設 1 等同 `--chat` |
 | `RD_AUTOSTOP` | `0` | 設 1 等同 `--auto-stop` |
 | `RD_NO_BUTTON` | `0` | 設 1 不顯示懸浮停止按鈕 |
-| `RD_WATCH_INTERVAL` | `20` | 自動偵測間隔（秒） |
+| `RD_WATCH_INTERVAL` | `20` | 自動偵測直播結束的間隔（秒） |
 | `RD_WATCH_MISSES` | `6` | 連續幾次沒偵測到 video 才自動停止 |
 
-改錄別的頻道：`RD_URL="https://discord.com/channels/…" record-discord`
+## License
+
+MIT
